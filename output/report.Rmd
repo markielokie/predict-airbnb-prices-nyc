@@ -1,0 +1,433 @@
+---
+title: "Predicting the Price of AirBnB Rental Listings in NYC using Machine Learning"
+author: "Marcus Loke"
+date: "April 11, 2021"
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set working directory to where test and train data are
+setwd("../Data/")
+
+# Load data
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+setwd("../Report/")
+train_reduced <- read.csv("train_reduced.csv")
+test_reduced <- read.csv("test_reduced.csv")
+
+# Load libraries
+library(tidyverse)
+library(tidytext)
+library(qdap)
+library(rpart)
+library(randomForest)
+library(corrplot)
+library(tm)
+library(caret)
+library(gbm)
+library(vtreat)
+library(xgboost)
+library(glmnet)
+
+# ggplot themes
+my_theme <- theme(
+  plot.title = element_text(size = 18)
+)
+```
+
+## Executive Summary
+
+In this Kaggle project, I sought to predict AirBnB rental listing prices in New York City using various machine learning techniques such as Linear Regression, Trees, Random Forests and XGBoost. In sum, XGBoost worked really well for me as it resulted in the lowest `test` RMSE of 53.186 and 60.469 on the Kaggle public and private leaderboards respectively.
+
+Through XGBoost, the most important features in the model were (in decreasing importance):
+
+1. `room_type` - the type of room (e.g., private room, shared room)
+2. `bathrooms` - the number of bathrooms
+3. `cleaning_fee` - amount required for cleaning fee
+4. `longitude` - the longitude coordinates of the listing
+5. `accommodates` - the total number of people that the listing can accommodate
+6. `bedrooms` - the number of bedrooms
+7. `latitude` - the latitude coordinates of the listing
+8. `availability_90` - the availability of the listing out of the next 90 days
+9. `neighbourhood_group_cleaned` - the boroughs in NYC
+10. `extra_people` - the price per additional guest
+11. `security_deposit` - amount required for security deposit
+12. `number_of_reviews` - total number of reviews of listing
+13. `minimum_nights` - minimum length of stay
+14. `polarity` - I added this new variable to the dataset, which is a sentiment score of the `description` variable
+15. `property_type` - the type of property (e.g., apartment, guesthouse)
+
+This report articulates the process of data exploration, data cleaning, model fitting and avenues for future work.
+
+## Data Exploration
+
+### Response Variable
+The response variable that we are predicting is `price`. Let's explore the distribution of price and see if there are outliers in the data.
+
+```{r price, echo=FALSE}
+train %>%
+  ggplot(aes(x = price)) +
+  geom_histogram(binwidth = 5) +
+  labs(title = "Distribution of AirBnB Prices") +
+  my_theme
+```
+
+As can be seen from the distribution, prices are skewed right, with the max price of \$993 and most of the prices around the region of \$100 to \$250. There are some \$0 listings as well, which warrants some data cleaning. Although the distribution is skewed right, I did not perform a log transform of the data as the prices did not seem too extreme.
+
+Next, I wanted to see if there were prices that were below and/or equal \$0. If there are, there's a need to remove these from the `train` set.
+
+```{r price_zero}
+# No listings have prices below $0
+mean(train$price < 0)
+
+# 20 listings have the price of $0
+sum(train$price == 0)
+```
+
+### Predictor Variables
+
+The entire `train` dataset consists of 96 variables, but not all should be included in the model. After doing some literature review, I investigated further into some of the numerical variables that I felt to be important below, namely: `accommodates`, `cleaning_fee`, `security_deposit`, `host_listings_count`, `minimum_nights`, `availability_90`, `extra_people`, `number_of_reviews`, `bathrooms` and `bedrooms`. Notably, there were quite a few "NAs" in `cleaning_fee` and `security_deposit`, which needs to be dealt with, or else it will affect the modeling.
+
+```{r predictor, warning=FALSE, echo=FALSE, fig.show="hold", out.width="50%"}
+# Plot the distribution of accommodations
+train %>%
+  ggplot(aes(x = accommodates)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Accommodations") +
+  my_theme
+
+# Plot the distribution of cleaning fees
+train %>%
+  ggplot(aes(x = cleaning_fee)) +
+  geom_histogram(binwidth = 5) +
+  labs(title = "Distribution of Cleaning Fees") +
+  my_theme
+
+# Plot the distribution of security deposit
+train %>%
+  ggplot(aes(x = security_deposit)) +
+  geom_histogram(binwidth = 30) +
+  labs(title = "Distribution of Security Deposits") +
+  my_theme
+
+# Plot the distribution of host listings count
+train %>%
+  ggplot(aes(x = host_listings_count)) +
+  geom_histogram(binwidth = 1) +
+  scale_x_continuous(limits = c(0, 100)) + 
+  labs(title = "Distribution of Host Listings Count") +
+  my_theme
+
+# Plot the distribution of minimum nights
+train %>%
+  ggplot(aes(x = minimum_nights)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Minimum Nights") +
+  my_theme
+
+# Plot the distribution of availability 90 days
+train %>%
+  ggplot(aes(x = availability_90)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Availability (90 Days)") +
+  my_theme
+
+# Plot the distribution of extra people
+train %>%
+  ggplot(aes(x = extra_people)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Cost per Extra Person") +
+  my_theme
+
+# Plot the distribution of number of reviews
+train %>%
+  ggplot(aes(x = number_of_reviews)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Number of Reviews") +
+  my_theme
+
+# Plot the distribution of bathrooms
+train %>%
+  ggplot(aes(x = bathrooms)) +
+  geom_histogram(binwidth = 1) + 
+  labs(title = "Distribution of Bathrooms") +
+  my_theme
+
+# Plot the distribution of bedrooms
+train %>%
+  ggplot(aes(x = bedrooms)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Bedrooms") +
+  my_theme
+```
+
+Are all `property_type` in `test` also in `train`? From the exploration, I realized there is a `property_type` called "Train" in `test` that is not in `train`. I will deal with this by imputing a property type that is similar to "Train".
+
+```{r predictor2}
+# "Train" is in test but not in train
+unique(test$property_type)[!unique(test$property_type) %in% unique(train$property_type)]
+```
+
+## Data Cleaning and Imputation
+
+Now that we have a better idea of what the data looks like, I proceeded to clean the data by imputing and removing unnecessary values in the variables.
+
+```{r cleaning}
+# Remove price = $0
+train <- train %>%
+  filter(price > 0)
+
+# Impute NAs in cleaning_fee to 0
+train$cleaning_fee[is.na(train$cleaning_fee)] = 0
+test$cleaning_fee[is.na(test$cleaning_fee)] = 0
+
+# Impute NAs in security_deposit to 0
+train$security_deposit[is.na(train$security_deposit)] = 0
+test$security_deposit[is.na(test$security_deposit)] = 0
+
+# Impute "Train" in test "property_type" to "Vacation home"
+test$property_type[test$property_type == "Train"] = "Vacation home"
+```
+
+### Adding "cozy", "spacious" and "private" as predictors
+
+Apart from the default 96 variables in the `train` dataset, I felt that the `description` variable has lots of potential to sieve particular words that were used repeatedly and these could affect rental prices. For example, the word "cozy" is a euphemism for a small place. Hence, I created 3 extra predictors that searched for words such as "cozy", "spacious" and "private" as they appeared many times.
+
+```{r cozy}
+# Adding "cozy", "spacious" and "private" as predictors
+cozy_rows <- grep(pattern="cozy", x=tolower(train$description))
+train$cozy <- F
+train$cozy[cozy_rows] <- T
+```
+
+4218 out of all rows had the word "cozy".
+
+```{r cozy2, echo=FALSE}
+table(train$cozy)
+```
+
+This amounted to 18% of the entire `train` dataset.
+
+```{r cozy3, echo=FALSE}
+length(cozy_rows) / length(train$description) # 18% of listings have "cozy"
+
+# Adding another predictor, "cozy", to train dataset
+cozy_rows <- grep(pattern="cozy", x=tolower(test$description))
+test$cozy <- F
+test$cozy[cozy_rows] <- T
+```
+
+```{r spacious, echo=FALSE}
+# Adding another variable, "spacious"
+spacious_rows <- grep(pattern="spacious", x=tolower(train$description))
+train$spacious <- F
+train$spacious[spacious_rows] <- T
+```
+
+Similarly, this was done for "spacious" and it amounted to 23% of the entire `train` dataset.
+
+```{r spacious2, echo=FALSE}
+length(spacious_rows) / length(train$description) # 23% of listings have "spacious"
+spacious_rows <- grep(pattern="spacious", x=tolower(test$description))
+test$spacious <- F
+test$spacious[spacious_rows] <- T
+```
+
+Finally, this was done for "private" and it amounted to 34% of the entire `train` dataset.
+
+```{r private, echo=FALSE}
+# Adding another variable, "private"
+private_rows <- grep(pattern="private", x=tolower(train$description))
+train$private <- F
+train$private[private_rows] <- T
+```
+
+```{r private2, echo=FALSE}
+length(private_rows) / length(train$description) # 34% of listings have "spacious"
+private_rows <- grep(pattern="private", x=tolower(test$description))
+test$private <- F
+test$private[private_rows] <- T
+```
+
+### Adding "polarity" as a predictor
+
+Since we are analyzing words in `description`, I felt there was value in doing a basic form of text analytics to determine the sentiment scores of the descriptions in each listing. I used the `qdap` library for the sentiment analysis, which essentially assigns a sentiment score (based on its lexicon library) for each word in `description`. The sentiment scores are tabulated for each listing and it can range from negative to positive values (i.e., negative values connote negative sentiments while positive values connote positive sentiments, and the magnitude of the values describe the strength). The code chunk looks like this:
+
+```{r polarity, eval=FALSE}
+# This creates the sentiment scores
+sentiments_train <- polarity(
+  removePunctuation(
+    removeNumbers(
+      tolower(train$description))), train$id)
+
+# Joining the sentiment scores to the train dataset and select key columns
+train <- inner_join(train, sentiments_train[[1]], by = "id")
+train <- train %>%
+  select(-pos.words, -neg.words, -wc, -text.var)
+```
+
+I have plotted the sentiment scores for the `train` dataset below and it seems that most descriptions are positive in general (i.e., polarity > 0), with few negative sentiments, which makes sense as owners would want to positively describe their listings to attract rentals.
+
+```{r polarity2, echo=FALSE, warning=FALSE}
+train_reduced %>%
+  ggplot(aes(x = polarity)) +
+  geom_histogram(binwidth = 0.1)
+```
+
+After adding the extra predictors to the datasets, I went on to clean/prepare the `train` and `test` data by ensuring character columns are `as.factor` and there are no "NAs" in the data. This will ensure that the modeling process is smooth and not return errors.
+
+### Correlation matrix
+
+```{r clean, echo=FALSE}
+# Cleaning the train and test data
+train_reduced$room_type <- as.factor(train_reduced$room_type)
+train_reduced$neighbourhood_group_cleansed <- as.factor(train_reduced$neighbourhood_group_cleansed)
+train_reduced$cancellation_policy <- as.factor(train_reduced$cancellation_policy)
+train_reduced$property_type <- as.factor(train_reduced$property_type)
+train_reduced$cozy <- as.factor(train_reduced$cozy)
+train_reduced$polarity[is.na(train_reduced$polarity)] = 0
+train_reduced$spacious <- as.factor(train_reduced$spacious)
+train_reduced$private <- as.factor(train_reduced$private)
+
+test_reduced$room_type <- as.factor(test_reduced$room_type)
+test_reduced$neighbourhood_group_cleansed <- as.factor(test_reduced$neighbourhood_group_cleansed)
+test_reduced$cancellation_policy <- as.factor(test_reduced$cancellation_policy)
+test_reduced$property_type <- as.factor(test_reduced$property_type)
+test_reduced$cozy <- as.factor(test_reduced$cozy)
+test_reduced$spacious <- as.factor(test_reduced$spacious)
+test_reduced$private <- as.factor(test_reduced$private)
+```
+
+Next, I plotted the correlation matrix to look for multicollinearity with the numerical predictors.  As can be seen below, there are some multicollinearity between `bedrooms`, `bathrooms` and `accommodates`, which makes intuitive sense as the number of people the listing can accommodate is limited by the number of bedrooms and bathrooms.
+
+Also, there is positive correlation between `bedrooms`, `accommodates` and `cleaning_fee`, which makes sense too as it takes more effort to clean listings with more bedrooms and people.
+
+Based on the corrplot, it seems that `accommodates`, `cleaning_fee` and `bedrooms` have the highest correlation to `price`. 
+
+```{r cor_matrix, echo=FALSE}
+# Plot correlation matrix on selected features
+corrplot(cor(train[,c("price", "accommodates", "cleaning_fee",
+                      "host_listings_count", "availability_90",
+                      "extra_people", "number_of_reviews",
+                      "bathrooms", "bedrooms", "security_deposit",
+                      "minimum_nights", "longitude", "latitude")]), 
+         method = "square", 
+         diag = T)
+```
+
+## Model Fitting
+
+### Linear regression
+
+First, I started the project with linear regression just to see how far I could go with a linear model. The results are as follows:
+
+Linear Model | Test RMSE (Private) | Test RMSE (Public)
+------------ | ------------ | -----------
+1 | 89.004 | 81.563
+2 | 84.137 | 77.222
+3 | 73.741 | 63.177
+4 | 73.119 | 62.797
+5 (best) | 73.112 | 62.725
+
+In Model 1, I started with only 6 predictors that I felt were important and slowly added predictors incrementally until I reached Model 5 with the lowest `train` RMSE. Eventually, I ended up with 18 predictors in Model 5, which yielded me the best `test` RMSE for the linear model. But I decided to stop using a linear model as I felt that the data might not be linear.
+
+### Trees
+
+I transited to using Trees with the same set of 18 predictors that were used in the linear model, but the `test` RMSE was worse than the linear model even though the `train` RMSE was lower. One possible explanation could be due to the overfitting that Trees are susceptible to. For this reason, I stopped experimenting with Trees and moved on to Random Forests.
+
+Tree Model | Test RMSE (Private) | Test RMSE (Public)
+------------ | ------------ | -----------
+1 | 77.033 | 68.431
+
+### Random forests
+
+Again, I used the same set of 18 predictors for the Random Forest model and the `test` RMSE was much better than both Linear Regression and Trees. I ran 2 Random Forest models: Model 1 is the default while Model 2 is tuned with `mtry = 5`. The results showed that the untuned model performed better on the `test` set. 
+
+Random Forest Model | Test RMSE (Private) | Test RMSE (Public)
+------------ | ------------ | -----------
+1 (best) | 64.988 | 56.349
+2 | 65.652 | 56.817
+
+### XGBoost (best model)
+
+The final modelling method that I used extensively was XGBoost as it gave me the best `test` RMSE on the public leaderboard. For this reason, I focused my efforts heavily on XGBoost to optimize the RMSE results. In total, I had 20 different XGBooost models but I will summarize a few that were notable. All XGBoost models were tuned with `nfold = 5` to find the optimal `nrounds`. Also, I decided to add in 2 more predictors to the XGBoost models (total 20 predictors), which resulted in the best model with lowest `test` RMSE for the project. 
+
+XGBoost Model | nrounds | Train RMSE | Test RMSE (Private) | Test RMSE (Public)
+---------- | -------  | ----------- | ---------- | ---------
+1 (best) | 32 | 45.83 | 60.47 | 53.19
+2 | 54 | 43.52 | 60.97 | 55.13
+3 | 56 | 42.65 | 60.75 | 53.28
+4 | 56 | 42.59 | 60.49 | 55.17
+
+One major observation that I noticed was that as `nrounds` went up, `train` RMSE would reduce, as can be seen in the table above, which is expected because the number of iterations (number of trees to grow) affects how closely fitted the model is to the training data. However, the increase in `nrounds` would also cause overfitting, as seen in the `test` RMSE. As a result of this bias-variance effect, I had to be cautious not to overly gloat over the lower `train` RMSE from models with higher `nrounds`. Not unexpectedly, my best model was one with `nrounds = 32`, not the higher ones.
+
+Below are the top 15 features selected by my best performing XGBoost model. It is interesting that the XGBoost model placed more emphasis on internal house attributes such as `room_type`, `bathrooms` and `cleaning_fee` over location attributes such as `longitude` and `neighbourhood_group_cleansed` (I always thought that location would affect price the most). 
+
+```{r xgboost, echo=FALSE, results=FALSE}
+trt <- designTreatmentsZ(dframe=train_reduced,
+                         varlist=names(train_reduced)[2:21])
+
+newvars <- trt$scoreFrame[trt$scoreFrame$code%in% c("clean", "lev"), "varName"]
+
+train_input <- prepare(treatmentplan=trt,
+                       dframe=train_reduced,
+                       varRestriction=newvars)
+
+test_input <- prepare(treatmentplan=trt,
+                      dframe=test_reduced,
+                      varRestriction=newvars)
+
+mod13 <- xgboost(data=as.matrix(train_input),
+                 label=train_reduced$price,
+                 nrounds=32,
+                 verbose=0)
+
+xgb.plot.importance(xgb.importance(model = mod13), top_n = 15)
+```
+
+## Conclusion
+
+Overall, the XGBoost model with the 20 predictors performed the best with a `test` RMSE of 60.468 (private leaderboard) and 53.186 (public leaderboard). Trees performed the worst on the `test` RMSE and it could be due to the overfitting of the model. Linear regression performed not so good as well and this could be due to the fact that this prediction problem is not linear in nature.
+
+### Future work
+
+Many of the predictors used in my best model had a right-skew in the distribution, which means that outliers may affect the model's performance. So it may be worthwhile to perform some transformation (e.g., log transformation) to the skewed data to ensure a close enough normal distribution.
+
+Also, it would be interesting to use proximity to amenities as a predictor for price. Heuristically speaking, it seems logical and plausible that being nearer to popular amenities would affect listing price. 
+
+## Appendix
+
+### 20 predictors used in the best model
+
+From the default `train` set:
+
+* `room_type`
+* `accommodates`
+* `cleaning_fee`
+* `host_listings_count`
+* `availability_90`
+* `extra_people`
+* `number_of_reviews`
+* `bathrooms`
+* `bedrooms`
+* `security_deposit`
+* `neighbourhood_group_cleansed`
+* `minimum_nights`
+* `longitude`
+* `latitude`
+* `cancellation_policy`
+* `property_type`
+
+Newly created predictors:
+
+* `polarity`
+* `cozy`
+* `spacious`
+* `private`
